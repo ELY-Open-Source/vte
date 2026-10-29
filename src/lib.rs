@@ -127,6 +127,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                State::ApcString => i += self.advance_apc_run(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -162,6 +163,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
         while i != bytes.len() && !performer.terminated() {
             match self.state {
                 State::Ground => i += self.advance_ground(performer, &bytes[i..]),
+                State::ApcString => i += self.advance_apc_run(performer, &bytes[i..]),
                 _ => {
                     // Inlining it results in worse codegen.
                     let byte = bytes[i];
@@ -469,6 +471,37 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             0x00..=0x17 | 0x19 | 0x1C..=0x1F => (),
             _ => self.action_apc_put(byte),
         }
+    }
+
+    /// An APC string up to ESC, CAN or SUB, at once.
+    #[inline]
+    fn advance_apc_run<P: Perform>(&mut self, performer: &mut P, bytes: &[u8]) -> usize {
+        let run = memchr::memchr3(0x1B, 0x18, 0x1A, bytes).unwrap_or(bytes.len());
+        if run == 0 {
+            self.advance_apc_string(performer, bytes[0]);
+            return 1;
+        }
+        let run_bytes = &bytes[..run];
+        // A control inside passes by, byte by byte, as rare.
+        if run_bytes.iter().fold(false, |found, &byte| found | (byte < 0x20)) {
+            for &byte in run_bytes {
+                self.advance_apc_string(performer, byte);
+            }
+            return run;
+        }
+        #[cfg(not(feature = "std"))]
+        let room = self.apc_raw.remaining_capacity();
+        #[cfg(feature = "std")]
+        let room = MAX_APC_RAW - self.apc_raw.len();
+        if self.apc_overflow || run > room {
+            self.apc_overflow = true;
+            return run;
+        }
+        #[cfg(not(feature = "std"))]
+        self.apc_raw.try_extend_from_slice(run_bytes).expect("room was checked");
+        #[cfg(feature = "std")]
+        self.apc_raw.extend_from_slice(run_bytes);
+        run
     }
 
     #[inline(always)]
@@ -1029,6 +1062,34 @@ mod tests {
         let apcs: Vec<_> =
             dispatcher.dispatched.iter().filter(|seq| matches!(seq, Sequence::Apc(_))).collect();
         assert_eq!(apcs, [&Sequence::Apc(b"Gi=3".to_vec())]);
+    }
+
+    #[cfg(feature = "std")]
+    #[test]
+    fn apc_filling_its_buffer_is_kept() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        let mut full = b"\x1b_G".to_vec();
+        full.extend([b'A'; MAX_APC_RAW - 1]);
+        full.extend(b"\x1b\\");
+        parser.advance(&mut dispatcher, &full[..20]);
+        parser.advance(&mut dispatcher, &full[20..]);
+
+        let mut expected = b"G".to_vec();
+        expected.extend([b'A'; MAX_APC_RAW - 1]);
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(expected));
+    }
+
+    #[test]
+    fn apc_passes_controls_inside_it_by() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1b_Gi=1;AA\r\nBB\x7f\x00");
+        parser.advance(&mut dispatcher, b"CC\x1b\\");
+
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Gi=1;AABB\x7fCC".to_vec()));
     }
 
     #[test]

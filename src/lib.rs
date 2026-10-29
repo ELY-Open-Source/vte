@@ -803,11 +803,31 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
     /// Handle ground dispatch of print/execute for all characters in a string.
     #[inline]
     fn ground_dispatch<P: Perform>(performer: &mut P, text: &str) {
-        for c in text.chars() {
-            match c {
-                '\x00'..='\x1f' | '\u{80}'..='\u{9f}' => performer.execute(c as u8),
-                _ => performer.print(c),
+        let bytes = text.as_bytes();
+        let (mut start, mut at) = (0, 0);
+        while at < bytes.len() {
+            // C0 is one byte; C1 is U+0080 to U+009F, two in UTF-8.
+            let control = match bytes[at] {
+                byte @ 0x00..=0x1f => Some((byte, 1)),
+                0xc2 => bytes
+                    .get(at + 1)
+                    .filter(|next| (0x80..=0x9f).contains(*next))
+                    .map(|&c1| (c1, 2)),
+                _ => None,
+            };
+            let Some((byte, len)) = control else {
+                at += 1;
+                continue;
+            };
+            if start < at {
+                performer.print_run(&text[start..at]);
             }
+            performer.execute(byte);
+            at += len;
+            start = at;
+        }
+        if start < bytes.len() {
+            performer.print_run(&text[start..]);
         }
     }
 }
@@ -845,6 +865,13 @@ enum State {
 pub trait Perform {
     /// Draw a character to the screen and update states.
     fn print(&mut self, _c: char) {}
+
+    /// Draw a run of characters holding no control, each as `print` would.
+    fn print_run(&mut self, run: &str) {
+        for c in run.chars() {
+            self.print(c);
+        }
+    }
 
     /// Execute a C0 or C1 control function.
     fn execute(&mut self, _byte: u8) {}
@@ -1090,6 +1117,26 @@ mod tests {
         parser.advance(&mut dispatcher, b"CC\x1b\\");
 
         assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Gi=1;AABB\x7fCC".to_vec()));
+    }
+
+    #[test]
+    fn ground_text_prints_in_runs_split_at_controls() {
+        #[derive(Default)]
+        struct Runs(Vec<String>);
+        impl Perform for Runs {
+            fn print_run(&mut self, run: &str) {
+                self.0.push(run.to_string());
+            }
+
+            fn execute(&mut self, byte: u8) {
+                self.0.push(format!("{byte:#x}"));
+            }
+        }
+
+        let mut runs = Runs::default();
+        let mut parser = Parser::new();
+        parser.advance(&mut runs, "ab\x07c\u{85}d\u{a0}é\x7f".as_bytes());
+        assert_eq!(runs.0, ["ab", "0x7", "c", "0x85", "d\u{a0}é\x7f"]);
     }
 
     #[test]

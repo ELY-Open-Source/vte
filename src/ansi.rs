@@ -505,6 +505,13 @@ pub trait Handler {
     /// A character to be displayed.
     fn input(&mut self, _c: char) {}
 
+    /// A run of characters holding no control, each as `input` would take it.
+    fn input_run(&mut self, run: &str) {
+        for c in run.chars() {
+            self.input(c);
+        }
+    }
+
     /// Set cursor to position.
     fn goto(&mut self, _line: i32, _col: usize) {}
 
@@ -1293,6 +1300,12 @@ where
     fn print(&mut self, c: char) {
         self.handler.input(c);
         self.state.preceding_char = Some(c);
+    }
+
+    #[inline]
+    fn print_run(&mut self, run: &str) {
+        self.handler.input_run(run);
+        self.state.preceding_char = run.chars().next_back();
     }
 
     #[inline]

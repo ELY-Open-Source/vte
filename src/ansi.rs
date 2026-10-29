@@ -700,6 +700,9 @@ pub trait Handler {
     /// Set hyperlink.
     fn set_hyperlink(&mut self, _: Option<Hyperlink>) {}
 
+    /// An application program command, its string without the ST.
+    fn apc(&mut self, _data: &[u8]) {}
+
     /// Set mouse cursor icon.
     fn set_mouse_cursor_icon(&mut self, _: CursorIcon) {}
 
@@ -1323,6 +1326,11 @@ where
     #[inline]
     fn unhook(&mut self) {
         debug!("[unhandled unhook]");
+    }
+
+    #[inline]
+    fn apc_dispatch(&mut self, data: &[u8]) {
+        self.handler.apc(data);
     }
 
     #[inline]

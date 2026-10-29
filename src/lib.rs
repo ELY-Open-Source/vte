@@ -44,6 +44,11 @@ pub use params::{Params, ParamsIter};
 const MAX_INTERMEDIATES: usize = 2;
 const MAX_OSC_PARAMS: usize = 16;
 const MAX_OSC_RAW: usize = 1024;
+/// The longest APC string kept; a longer one is dropped.
+#[cfg(all(feature = "std", not(test)))]
+const MAX_APC_RAW: usize = 64 * 1024 * 1024;
+#[cfg(all(feature = "std", test))]
+const MAX_APC_RAW: usize = 64;
 
 /// Parser for raw _VTE_ protocol which delegates actions to a [`Perform`]
 ///
@@ -64,6 +69,11 @@ pub struct Parser<const OSC_RAW_BUF_SIZE: usize = MAX_OSC_RAW> {
     osc_raw: Vec<u8>,
     osc_params: [(usize, usize); MAX_OSC_PARAMS],
     osc_num_params: usize,
+    #[cfg(not(feature = "std"))]
+    apc_raw: ArrayVec<u8, OSC_RAW_BUF_SIZE>,
+    #[cfg(feature = "std")]
+    apc_raw: Vec<u8>,
+    apc_overflow: bool,
     ignoring: bool,
     partial_utf8: [u8; 4],
     partial_utf8_len: usize,
@@ -180,6 +190,7 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             State::EscapeIntermediate => self.advance_esc_intermediate(performer, byte),
             State::OscString => self.advance_osc_string(performer, byte),
             State::SosPmApcString => self.anywhere(performer, byte),
+            State::ApcString => self.advance_apc_string(performer, byte),
             State::Ground => unreachable!(),
         }
     }
@@ -374,7 +385,12 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
                 self.osc_num_params = 0;
                 self.state = State::OscString
             },
-            0x5E..=0x5F => self.state = State::SosPmApcString,
+            0x5E => self.state = State::SosPmApcString,
+            0x5F => {
+                self.apc_raw.clear();
+                self.apc_overflow = false;
+                self.state = State::ApcString
+            },
             0x60..=0x7E => {
                 performer.esc_dispatch(self.intermediates(), self.ignoring, byte);
                 self.state = State::Ground
@@ -432,6 +448,40 @@ impl<const OSC_RAW_BUF_SIZE: usize> Parser<OSC_RAW_BUF_SIZE> {
             },
             _ => self.action_osc_put(byte),
         }
+    }
+
+    #[inline(always)]
+    fn advance_apc_string<P: Perform>(&mut self, performer: &mut P, byte: u8) {
+        match byte {
+            0x18 | 0x1A => {
+                self.apc_raw.clear();
+                performer.execute(byte);
+                self.state = State::Ground
+            },
+            0x1B => {
+                if !self.apc_overflow {
+                    performer.apc_dispatch(&self.apc_raw);
+                }
+                self.apc_raw.clear();
+                self.reset_params();
+                self.state = State::Escape
+            },
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => (),
+            _ => self.action_apc_put(byte),
+        }
+    }
+
+    #[inline(always)]
+    fn action_apc_put(&mut self, byte: u8) {
+        #[cfg(not(feature = "std"))]
+        let full = self.apc_raw.is_full();
+        #[cfg(feature = "std")]
+        let full = self.apc_raw.len() >= MAX_APC_RAW;
+        if full {
+            self.apc_overflow = true;
+            return;
+        }
+        self.apc_raw.push(byte);
     }
 
     #[inline(always)]
@@ -744,6 +794,7 @@ enum State {
     EscapeIntermediate,
     OscString,
     SosPmApcString,
+    ApcString,
     #[default]
     Ground,
 }
@@ -790,6 +841,9 @@ pub trait Perform {
 
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
+
+    /// An APC string, without its ST; CAN or SUB cancel it.
+    fn apc_dispatch(&mut self, _data: &[u8]) {}
 
     /// A final character has arrived for a CSI sequence
     ///
@@ -857,9 +911,14 @@ mod tests {
         Print(char),
         Execute(u8),
         DcsUnhook,
+        Apc(Vec<u8>),
     }
 
     impl Perform for Dispatcher {
+        fn apc_dispatch(&mut self, data: &[u8]) {
+            self.dispatched.push(Sequence::Apc(data.to_vec()));
+        }
+
         fn osc_dispatch(&mut self, params: &[&[u8]], bell_terminated: bool) {
             let params = params.iter().map(|p| p.to_vec()).collect();
             self.dispatched.push(Sequence::Osc(params, bell_terminated));
@@ -915,6 +974,70 @@ mod tests {
             },
             _ => panic!("expected osc sequence"),
         }
+    }
+
+    #[test]
+    fn parse_apc() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1b_Gi=1,a=q;AAAA\x1b\\x");
+
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Gi=1,a=q;AAAA".to_vec()));
+        assert_eq!(dispatcher.dispatched[1], Sequence::Esc(vec![], false, b'\\'));
+        assert_eq!(dispatcher.dispatched[2], Sequence::Print('x'));
+        assert_eq!(dispatcher.dispatched.len(), 3);
+    }
+
+    #[test]
+    fn apc_split_across_reads() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1b_Gi=1;");
+        parser.advance(&mut dispatcher, b"AA\x07AA\x1b\\");
+
+        assert_eq!(dispatcher.dispatched[0], Sequence::Apc(b"Gi=1;AAAA".to_vec()));
+    }
+
+    #[test]
+    fn can_and_sub_cancel_apc() {
+        for cancel in [0x18u8, 0x1a] {
+            let mut dispatcher = Dispatcher::default();
+            let mut parser = Parser::new();
+
+            parser.advance(&mut dispatcher, b"\x1b_Gi=1;AA");
+            parser.advance(&mut dispatcher, &[cancel]);
+            parser.advance(&mut dispatcher, b"\x1b_Gi=2\x1b\\");
+
+            assert_eq!(dispatcher.dispatched[0], Sequence::Execute(cancel));
+            assert_eq!(dispatcher.dispatched[1], Sequence::Apc(b"Gi=2".to_vec()));
+        }
+    }
+
+    #[test]
+    fn apc_past_its_buffer_is_dropped() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        let mut long = b"\x1b_G".to_vec();
+        long.extend([b'A'; MAX_APC_RAW]);
+        long.extend(b"\x1b\\\x1b_Gi=3\x1b\\");
+        parser.advance(&mut dispatcher, &long);
+
+        let apcs: Vec<_> =
+            dispatcher.dispatched.iter().filter(|seq| matches!(seq, Sequence::Apc(_))).collect();
+        assert_eq!(apcs, [&Sequence::Apc(b"Gi=3".to_vec())]);
+    }
+
+    #[test]
+    fn sos_and_pm_stay_ignored() {
+        let mut dispatcher = Dispatcher::default();
+        let mut parser = Parser::new();
+
+        parser.advance(&mut dispatcher, b"\x1bXsos\x1b\\\x1b^pm\x1b\\");
+
+        assert!(!dispatcher.dispatched.iter().any(|seq| matches!(seq, Sequence::Apc(_))));
     }
 
     #[test]

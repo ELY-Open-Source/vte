@@ -842,7 +842,7 @@ pub trait Perform {
     /// Dispatch an operating system command.
     fn osc_dispatch(&mut self, _params: &[&[u8]], _bell_terminated: bool) {}
 
-    /// An APC string, without its ST; CAN or SUB cancel it.
+    /// An APC string, its ST left out; CAN, SUB cancel.
     fn apc_dispatch(&mut self, _data: &[u8]) {}
 
     /// A final character has arrived for a CSI sequence
@@ -1015,6 +1015,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "std")]
     #[test]
     fn apc_past_its_buffer_is_dropped() {
         let mut dispatcher = Dispatcher::default();

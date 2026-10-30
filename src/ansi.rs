@@ -701,6 +701,9 @@ pub trait Handler {
     /// Report text area size in pixels.
     fn text_area_size_pixels(&mut self) {}
 
+    /// Report a cell's size in pixels.
+    fn cell_size_pixels(&mut self) {}
+
     /// Report text area size in characters.
     fn text_area_size_chars(&mut self) {}
 
@@ -1759,6 +1762,7 @@ where
             ('T', []) => handler.scroll_down(next_param_or(1) as usize),
             ('t', []) => match next_param_or(1) as usize {
                 14 => handler.text_area_size_pixels(),
+                16 => handler.cell_size_pixels(),
                 18 => handler.text_area_size_chars(),
                 22 => handler.push_title(),
                 23 => handler.pop_title(),
@@ -2067,6 +2071,7 @@ mod tests {
         identity_reported: bool,
         color: Option<Rgb>,
         reset_colors: Vec<usize>,
+        sizes: Vec<u16>,
     }
 
     impl Handler for MockHandler {
@@ -2098,6 +2103,18 @@ mod tests {
         fn reset_color(&mut self, index: usize) {
             self.reset_colors.push(index)
         }
+
+        fn text_area_size_pixels(&mut self) {
+            self.sizes.push(14);
+        }
+
+        fn cell_size_pixels(&mut self) {
+            self.sizes.push(16);
+        }
+
+        fn text_area_size_chars(&mut self) {
+            self.sizes.push(18);
+        }
     }
 
     impl Default for MockHandler {
@@ -2109,6 +2126,7 @@ mod tests {
                 identity_reported: false,
                 color: None,
                 reset_colors: Vec::new(),
+                sizes: Vec::new(),
             }
         }
     }
@@ -2123,6 +2141,16 @@ mod tests {
         parser.advance(&mut handler, BYTES);
 
         assert_eq!(handler.attr, Some(Attr::Bold));
+    }
+
+    #[test]
+    fn each_size_report_is_dispatched() {
+        let mut parser = Processor::<TestSyncHandler>::new();
+        let mut handler = MockHandler::default();
+
+        parser.advance(&mut handler, b"\x1b[14t\x1b[16t\x1b[18t");
+
+        assert_eq!(handler.sizes, [14, 16, 18]);
     }
 
     #[test]
